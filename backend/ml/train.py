@@ -1,420 +1,473 @@
 from pathlib import Path
-import math
-import re
-import pickle
+import json
+import random
 
 import numpy as np
-import pandas as pd
+import torch
 from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    Trainer,
+    TrainingArguments,
+)
 
 
 # ============================================================
-# PATHS
+# MIND PULSE V4
+# DistilBERT Emotion Classifier
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
+MODEL_DIR = BASE_DIR / "emotion_model_v4"
 
-MODEL_PATH = BASE_DIR / "emotion_model.pkl"
+MODEL_NAME = "distilbert-base-uncased"
+
+RANDOM_SEED = 42
+
+# CPU-friendly first experiment
+MAX_TRAIN_PER_CLASS = 2500
+MAX_VALIDATION_PER_CLASS = 600
+MAX_TEST_PER_CLASS = 600
+
+MAX_LENGTH = 96
+
+NUM_LABELS = 6
 
 
 # ============================================================
-# GOEMOTIONS → MIND PULSE MAPPING
+# REPRODUCIBILITY
 # ============================================================
 
-EMOTION_MAP = {
-    # Positive
-    "admiration": "Positive",
-    "amusement": "Positive",
-    "approval": "Positive",
-    "caring": "Positive",
-    "excitement": "Positive",
-    "gratitude": "Positive",
-    "joy": "Positive",
-    "love": "Positive",
-    "optimism": "Positive",
-    "pride": "Positive",
-    "relief": "Positive",
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
 
-    # Sad
-    "disappointment": "Sad",
-    "grief": "Sad",
-    "remorse": "Sad",
-    "sadness": "Sad",
 
-    # Angry
-    "anger": "Angry",
-    "annoyance": "Angry",
-    "disapproval": "Angry",
-    "disgust": "Angry",
+# ============================================================
+# EMOTION MAPPING
+# ============================================================
 
-    # Fear
-    "fear": "Fear",
-    "nervousness": "Fear",
+EMOTION_GROUPS = {
+    "Positive": {
+        "admiration",
+        "amusement",
+        "approval",
+        "caring",
+        "excitement",
+        "gratitude",
+        "joy",
+        "love",
+        "optimism",
+        "pride",
+        "relief",
+    },
 
-    # Confused
-    "confusion": "Confused",
+    "Sad": {
+        "disappointment",
+        "grief",
+        "remorse",
+        "sadness",
+    },
 
-    # Neutral / mixed
-    "realization": "Neutral",
-    "surprise": "Neutral",
-    "neutral": "Neutral",
-    "curiosity": "Neutral",
-    "desire": "Neutral",
-    "embarrassment": "Neutral",
+    "Angry": {
+        "anger",
+        "annoyance",
+        "disapproval",
+        "disgust",
+    },
+
+    "Fear": {
+        "fear",
+        "nervousness",
+    },
+
+    "Confused": {
+        "confusion",
+    },
+
+    "Neutral": {
+        "neutral",
+        "realization",
+    },
+}
+
+
+LABEL_NAMES = [
+    "Angry",
+    "Confused",
+    "Fear",
+    "Neutral",
+    "Positive",
+    "Sad",
+]
+
+
+LABEL2ID = {
+    label: index
+    for index, label in enumerate(LABEL_NAMES)
+}
+
+ID2LABEL = {
+    index: label
+    for index, label in enumerate(LABEL_NAMES)
 }
 
 
 # ============================================================
-# TEXT TOKENIZATION
+# DATA PREPARATION
 # ============================================================
 
-def tokenize(text):
-    """
-    Convert text into simple lowercase word tokens.
-    """
+def create_label_mapping(dataset):
 
-    text = text.lower()
+    label_names = dataset.features["labels"].feature.names
 
-    return re.findall(r"\b[a-zA-Z']+\b", text)
+    mapping = {}
+
+    for index, name in enumerate(label_names):
+
+        for target_emotion, source_emotions in EMOTION_GROUPS.items():
+
+            if name in source_emotions:
+
+                mapping[index] = target_emotion
+
+    return mapping
+
+
+def prepare_dataframe(dataset, label_mapping):
+
+    rows = []
+
+    for item in dataset:
+
+        text = str(item["text"]).strip()
+
+        if not text:
+            continue
+
+        labels = item["labels"]
+
+        if labels is None or len(labels) == 0:
+            continue
+
+        label_id = labels[0]
+
+        if label_id not in label_mapping:
+            continue
+
+        emotion = label_mapping[label_id]
+
+        rows.append({
+            "text": text,
+            "emotion": emotion,
+        })
+
+    # Remove exact duplicate texts
+    unique_rows = {}
+
+    for row in rows:
+
+        text_key = row["text"].lower().strip()
+
+        if text_key not in unique_rows:
+
+            unique_rows[text_key] = row
+
+    rows = list(unique_rows.values())
+
+    return rows
 
 
 # ============================================================
-# BUILD VOCABULARY
+# BALANCED SUBSET
 # ============================================================
 
-def build_vocabulary(texts, min_df=2, max_features=30000):
-    """
-    Build vocabulary from training text.
+def create_balanced_subset(rows, max_per_class):
 
-    min_df:
-        Ignore words appearing in fewer than min_df documents.
-
-    max_features:
-        Keep only the most frequent features.
-    """
-
-    document_frequency = {}
-    word_frequency = {}
-
-    for text in texts:
-
-        tokens = tokenize(text)
-
-        unique_tokens = set(tokens)
-
-        for token in unique_tokens:
-            document_frequency[token] = (
-                document_frequency.get(token, 0) + 1
-            )
-
-        for token in tokens:
-            word_frequency[token] = (
-                word_frequency.get(token, 0) + 1
-            )
-
-    valid_words = [
-        word
-        for word, count in document_frequency.items()
-        if count >= min_df
-    ]
-
-    # Keep the most frequent words
-    valid_words.sort(
-        key=lambda word: word_frequency[word],
-        reverse=True
-    )
-
-    valid_words = valid_words[:max_features]
-
-    vocabulary = {
-        word: index
-        for index, word in enumerate(valid_words)
+    grouped = {
+        label: []
+        for label in LABEL_NAMES
     }
 
-    return vocabulary
+    for row in rows:
+
+        emotion = row["emotion"]
+
+        if emotion in grouped:
+            grouped[emotion].append(row)
+
+    rng = random.Random(RANDOM_SEED)
+
+    selected = []
+
+    print("\nClass distribution:")
+
+    for label in LABEL_NAMES:
+
+        examples = grouped[label]
+
+        rng.shuffle(examples)
+
+        selected_examples = examples[:max_per_class]
+
+        selected.extend(selected_examples)
+
+        print(
+            f"{label:<12}: "
+            f"{len(examples):>6} available → "
+            f"{len(selected_examples):>6} selected"
+        )
+
+    rng.shuffle(selected)
+
+    return selected
 
 
 # ============================================================
-# TF-IDF
+# TOKENIZATION
 # ============================================================
 
-def compute_tf_idf(texts, vocabulary, idf=None):
-    """
-    Convert text into TF-IDF vectors.
+def tokenize_dataset(rows, tokenizer):
 
-    TF  = Term Frequency
-    IDF = Inverse Document Frequency
-    """
+    texts = [
+        row["text"]
+        for row in rows
+    ]
 
-    num_documents = len(texts)
-    vocab_size = len(vocabulary)
+    labels = [
+        LABEL2ID[row["emotion"]]
+        for row in rows
+    ]
 
-    matrix = np.zeros(
-        (num_documents, vocab_size),
-        dtype=np.float32
+    encoded = tokenizer(
+        texts,
+        truncation=True,
+        padding="max_length",
+        max_length=MAX_LENGTH,
     )
 
-    # --------------------------------------------------------
-    # Term Frequency
-    # --------------------------------------------------------
+    encoded["labels"] = labels
 
-    for row, text in enumerate(texts):
+    return encoded
 
-        tokens = tokenize(text)
 
-        if not tokens:
-            continue
+# ============================================================
+# PYTORCH DATASET
+# ============================================================
 
-        counts = {}
+class EmotionDataset(torch.utils.data.Dataset):
 
-        for token in tokens:
+    def __init__(self, encodings):
 
-            if token in vocabulary:
-                counts[token] = counts.get(token, 0) + 1
+        self.encodings = encodings
 
-        total_words = sum(counts.values())
+    def __len__(self):
 
-        if total_words == 0:
-            continue
+        return len(self.encodings["labels"])
 
-        for token, count in counts.items():
+    def __getitem__(self, index):
 
-            column = vocabulary[token]
+        item = {}
 
-            matrix[row, column] = count / total_words
+        for key in self.encodings:
 
-    # --------------------------------------------------------
-    # IDF
-    # --------------------------------------------------------
+            item[key] = torch.tensor(
+                self.encodings[key][index]
+            )
 
-    if idf is None:
+        return item
 
-        document_frequency = np.zeros(
-            vocab_size,
-            dtype=np.float32
-        )
 
-        for text in texts:
+# ============================================================
+# METRICS
+# ============================================================
 
-            tokens = set(tokenize(text))
+def calculate_metrics(eval_prediction):
 
-            for token in tokens:
+    predictions, labels = eval_prediction
 
-                if token in vocabulary:
-
-                    document_frequency[
-                        vocabulary[token]
-                    ] += 1
-
-        idf = np.log(
-            (1 + num_documents)
-            / (1 + document_frequency)
-        ) + 1
-
-    # --------------------------------------------------------
-    # TF × IDF
-    # --------------------------------------------------------
-
-    matrix *= idf
-
-    # L2 normalization
-    norms = np.linalg.norm(
-        matrix,
-        axis=1,
-        keepdims=True
+    predictions = np.argmax(
+        predictions,
+        axis=1
     )
-
-    norms[norms == 0] = 1
-
-    matrix = matrix / norms
-
-    return matrix, idf
-
-
-# ============================================================
-# MULTINOMIAL NAIVE BAYES
-# ============================================================
-
-class MultinomialNaiveBayes:
-
-    def __init__(self):
-
-        self.classes = None
-        self.class_log_prior = None
-        self.feature_log_prob = None
-
-    def fit(self, X, y):
-
-        self.classes = np.unique(y)
-
-        num_classes = len(self.classes)
-        num_features = X.shape[1]
-
-        self.class_log_prior = np.zeros(
-            num_classes
-        )
-
-        self.feature_log_prob = np.zeros(
-            (num_classes, num_features)
-        )
-
-        # ----------------------------------------------------
-        # Train each class
-        # ----------------------------------------------------
-
-        for class_index, class_name in enumerate(
-            self.classes
-        ):
-
-            class_mask = y == class_name
-
-            X_class = X[class_mask]
-
-            # Prior probability
-            class_count = X_class.shape[0]
-
-            self.class_log_prior[class_index] = math.log(
-                class_count / len(y)
-            )
-
-            # Feature counts
-            feature_counts = X_class.sum(
-                axis=0
-            )
-
-            # Laplace smoothing
-            feature_counts = feature_counts + 1.0
-
-            total_features = feature_counts.sum()
-
-            probabilities = (
-                feature_counts
-                / total_features
-            )
-
-            self.feature_log_prob[
-                class_index
-            ] = np.log(probabilities)
-
-        return self
-
-    def predict_proba(self, X):
-
-        scores = (
-            X @ self.feature_log_prob.T
-            + self.class_log_prior
-        )
-
-        # Numerical stability
-        max_scores = np.max(
-            scores,
-            axis=1,
-            keepdims=True
-        )
-
-        exp_scores = np.exp(
-            scores - max_scores
-        )
-
-        probabilities = (
-            exp_scores
-            / exp_scores.sum(
-                axis=1,
-                keepdims=True
-            )
-        )
-
-        return probabilities
-
-    def predict(self, X):
-
-        probabilities = self.predict_proba(X)
-
-        indices = np.argmax(
-            probabilities,
-            axis=1
-        )
-
-        return self.classes[indices]
-
-
-# ============================================================
-# DATASET CONVERSION
-# ============================================================
-
-def convert_split(dataset_split, label_names):
-
-    texts = []
-    emotions = []
-
-    for item in dataset_split:
-
-        label_id = item["labels"][0]
-
-        original_label = label_names[label_id]
-
-        if original_label not in EMOTION_MAP:
-            continue
-
-        texts.append(item["text"])
-
-        emotions.append(
-            EMOTION_MAP[original_label]
-        )
-
-    return pd.DataFrame(
-        {
-            "text": texts,
-            "emotion": emotions
-        }
-    )
-
-
-# ============================================================
-# EVALUATION
-# ============================================================
-
-def evaluate_model(model, X, y, split_name):
-
-    predictions = model.predict(X)
 
     accuracy = np.mean(
-        predictions == y
+        predictions == labels
     )
 
-    print("\n" + "=" * 60)
-    print(f"{split_name.upper()} RESULTS")
-    print("=" * 60)
+    f1_scores = []
+
+    precision_scores = []
+
+    recall_scores = []
+
+    for class_id in range(NUM_LABELS):
+
+        true_positive = np.sum(
+            (predictions == class_id)
+            & (labels == class_id)
+        )
+
+        false_positive = np.sum(
+            (predictions == class_id)
+            & (labels != class_id)
+        )
+
+        false_negative = np.sum(
+            (predictions != class_id)
+            & (labels == class_id)
+        )
+
+        precision = (
+            true_positive
+            / (true_positive + false_positive)
+            if true_positive + false_positive > 0
+            else 0.0
+        )
+
+        recall = (
+            true_positive
+            / (true_positive + false_negative)
+            if true_positive + false_negative > 0
+            else 0.0
+        )
+
+        f1 = (
+            2 * precision * recall
+            / (precision + recall)
+            if precision + recall > 0
+            else 0.0
+        )
+
+        precision_scores.append(precision)
+
+        recall_scores.append(recall)
+
+        f1_scores.append(f1)
+
+    macro_f1 = np.mean(f1_scores)
+
+    return {
+        "accuracy": float(accuracy),
+        "macro_f1": float(macro_f1),
+        "macro_precision": float(
+            np.mean(precision_scores)
+        ),
+        "macro_recall": float(
+            np.mean(recall_scores)
+        ),
+    }
+
+
+# ============================================================
+# CONFUSION MATRIX
+# ============================================================
+
+def print_confusion_matrix(predictions, labels):
+
+    predictions = np.argmax(
+        predictions,
+        axis=1
+    )
+
+    matrix = np.zeros(
+        (NUM_LABELS, NUM_LABELS),
+        dtype=int
+    )
+
+    for actual, predicted in zip(
+        labels,
+        predictions
+    ):
+
+        matrix[actual][predicted] += 1
+
+    print("\nConfusion Matrix")
+    print("Rows = Actual")
+    print("Columns = Predicted\n")
 
     print(
-        f"\nAccuracy: {accuracy:.4f}"
+        f"{'':<12}"
+        + "".join(
+            f"{label:<12}"
+            for label in LABEL_NAMES
+        )
     )
+
+    for i, label in enumerate(LABEL_NAMES):
+
+        print(
+            f"{label:<12}"
+            + "".join(
+                f"{matrix[i][j]:<12}"
+                for j in range(NUM_LABELS)
+            )
+        )
+
+
+# ============================================================
+# PER-CLASS REPORT
+# ============================================================
+
+def print_per_class_report(predictions, labels):
+
+    predictions = np.argmax(
+        predictions,
+        axis=1
+    )
+
+    print("\nPer-class metrics:")
 
     print(
-        f"Correct: {(predictions == y).sum()}"
-        f" / {len(y)}"
+        f"{'Class':<12}"
+        f"{'Precision':<12}"
+        f"{'Recall':<12}"
+        f"{'F1':<12}"
     )
 
-    print("\nPer-class results:")
+    for class_id, label in enumerate(LABEL_NAMES):
 
-    for class_name in model.classes:
+        tp = np.sum(
+            (predictions == class_id)
+            & (labels == class_id)
+        )
 
-        mask = y == class_name
+        fp = np.sum(
+            (predictions == class_id)
+            & (labels != class_id)
+        )
 
-        if mask.sum() == 0:
-            continue
+        fn = np.sum(
+            (predictions != class_id)
+            & (labels == class_id)
+        )
 
-        class_accuracy = np.mean(
-            predictions[mask] == y[mask]
+        precision = (
+            tp / (tp + fp)
+            if tp + fp > 0
+            else 0
+        )
+
+        recall = (
+            tp / (tp + fn)
+            if tp + fn > 0
+            else 0
+        )
+
+        f1 = (
+            2 * precision * recall
+            / (precision + recall)
+            if precision + recall > 0
+            else 0
         )
 
         print(
-            f"{class_name:10s} "
-            f"{class_accuracy:.4f} "
-            f"({mask.sum()} samples)"
+            f"{label:<12}"
+            f"{precision:<12.4f}"
+            f"{recall:<12.4f}"
+            f"{f1:<12.4f}"
         )
-
-    return accuracy
 
 
 # ============================================================
@@ -424,12 +477,28 @@ def evaluate_model(model, X, y, split_name):
 def main():
 
     print("\n")
-    print("=" * 60)
-    print("             MIND PULSE ML TRAINING")
-    print("=" * 60)
+    print("=" * 65)
+    print("          MIND PULSE — V4 DISTILBERT")
+    print("=" * 65)
+
+    print("\n🧠 Device configuration")
+
+    device = (
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    print(f"Device: {device}")
+
+    if device == "cpu":
+
+        print(
+            "⚠️ CPU training enabled."
+        )
 
     # --------------------------------------------------------
-    # 1. Load GoEmotions
+    # LOAD DATASET
     # --------------------------------------------------------
 
     print("\n📥 Loading GoEmotions...")
@@ -439,242 +508,477 @@ def main():
         "simplified"
     )
 
-    label_names = (
-        dataset["train"]
-        .features["labels"]
-        .feature
-        .names
-    )
-
     print("✅ Dataset loaded")
 
-    print(dataset)
-
     # --------------------------------------------------------
-    # 2. Convert labels
+    # LABEL MAPPING
     # --------------------------------------------------------
 
-    print("\n🔄 Converting emotion labels...")
+    print("\n🔄 Creating emotion mapping...")
 
-    train_df = convert_split(
+    label_mapping = create_label_mapping(
+        dataset["train"]
+    )
+
+    # --------------------------------------------------------
+    # CLEAN DATA
+    # --------------------------------------------------------
+
+    print("\n🧹 Cleaning datasets...")
+
+    train_rows = prepare_dataframe(
         dataset["train"],
-        label_names
+        label_mapping
     )
 
-    validation_df = convert_split(
+    validation_rows = prepare_dataframe(
         dataset["validation"],
-        label_names
+        label_mapping
     )
 
-    test_df = convert_split(
+    test_rows = prepare_dataframe(
         dataset["test"],
-        label_names
+        label_mapping
+    )
+
+    print("\nClean dataset sizes:")
+
+    print(
+        f"Training   : {len(train_rows)}"
     )
 
     print(
-        f"\nTraining examples:   {len(train_df)}"
+        f"Validation : {len(validation_rows)}"
     )
 
     print(
-        f"Validation examples: {len(validation_df)}"
+        f"Test       : {len(test_rows)}"
+    )
+
+    # --------------------------------------------------------
+    # CREATE CONTROLLED BALANCED SUBSETS
+    # --------------------------------------------------------
+
+    print("\n⚖️ Creating balanced training subset...")
+
+    train_rows = create_balanced_subset(
+        train_rows,
+        MAX_TRAIN_PER_CLASS
+    )
+
+    print("\n⚖️ Creating validation subset...")
+
+    validation_rows = create_balanced_subset(
+        validation_rows,
+        MAX_VALIDATION_PER_CLASS
+    )
+
+    print("\n⚖️ Creating test subset...")
+
+    test_rows = create_balanced_subset(
+        test_rows,
+        MAX_TEST_PER_CLASS
+    )
+
+    print("\nFinal experiment sizes:")
+
+    print(
+        f"Training   : {len(train_rows)}"
     )
 
     print(
-        f"Test examples:       {len(test_df)}"
-    )
-
-    # --------------------------------------------------------
-    # 3. Class distribution
-    # --------------------------------------------------------
-
-    print("\n📊 Training class distribution:")
-
-    print(
-        train_df["emotion"]
-        .value_counts()
-    )
-
-    # --------------------------------------------------------
-    # 4. Build vocabulary
-    # --------------------------------------------------------
-
-    print("\n🧠 Building vocabulary...")
-
-    vocabulary = build_vocabulary(
-        train_df["text"].tolist(),
-        min_df=2,
-        max_features=30000
+        f"Validation : {len(validation_rows)}"
     )
 
     print(
-        f"Vocabulary size: {len(vocabulary)}"
+        f"Test       : {len(test_rows)}"
     )
 
     # --------------------------------------------------------
-    # 5. TF-IDF training
+    # LOAD TOKENIZER
     # --------------------------------------------------------
 
-    print("\n⚙️ Creating training TF-IDF...")
+    print("\n🔤 Loading DistilBERT tokenizer...")
 
-    X_train, idf = compute_tf_idf(
-        train_df["text"].tolist(),
-        vocabulary
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME
     )
 
-    print(
-        f"Training matrix: {X_train.shape}"
+    print("✅ Tokenizer loaded")
+
+    # --------------------------------------------------------
+    # TOKENIZE
+    # --------------------------------------------------------
+
+    print("\n⚙️ Tokenizing training data...")
+
+    train_encodings = tokenize_dataset(
+        train_rows,
+        tokenizer
     )
 
-    # --------------------------------------------------------
-    # 6. TF-IDF validation
-    # --------------------------------------------------------
+    print("⚙️ Tokenizing validation data...")
 
-    print("\n⚙️ Creating validation TF-IDF...")
-
-    X_validation, _ = compute_tf_idf(
-        validation_df["text"].tolist(),
-        vocabulary,
-        idf
+    validation_encodings = tokenize_dataset(
+        validation_rows,
+        tokenizer
     )
 
-    # --------------------------------------------------------
-    # 7. TF-IDF test
-    # --------------------------------------------------------
+    print("⚙️ Tokenizing test data...")
 
-    print("\n⚙️ Creating test TF-IDF...")
-
-    X_test, _ = compute_tf_idf(
-        test_df["text"].tolist(),
-        vocabulary,
-        idf
+    test_encodings = tokenize_dataset(
+        test_rows,
+        tokenizer
     )
 
-    # --------------------------------------------------------
-    # 8. Train model
-    # --------------------------------------------------------
-
-    print("\n🤖 Training Multinomial Naive Bayes...")
-
-    model = MultinomialNaiveBayes()
-
-    model.fit(
-        X_train,
-        train_df["emotion"].to_numpy()
+    train_dataset = EmotionDataset(
+        train_encodings
     )
 
-    print("✅ Training complete!")
+    validation_dataset = EmotionDataset(
+        validation_encodings
+    )
 
-    # --------------------------------------------------------
-    # 9. Validation
-    # --------------------------------------------------------
-
-    evaluate_model(
-        model,
-        X_validation,
-        validation_df["emotion"].to_numpy(),
-        "Validation"
+    test_dataset = EmotionDataset(
+        test_encodings
     )
 
     # --------------------------------------------------------
-    # 10. Test
+    # LOAD MODEL
     # --------------------------------------------------------
 
-    test_accuracy = evaluate_model(
-        model,
-        X_test,
-        test_df["emotion"].to_numpy(),
-        "Test"
+    print("\n🤖 Loading pretrained DistilBERT...")
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        MODEL_NAME,
+        num_labels=NUM_LABELS,
+        id2label=ID2LABEL,
+        label2id=LABEL2ID,
+    )
+
+    print("✅ Model loaded")
+
+    # --------------------------------------------------------
+    # TRAINING ARGUMENTS
+    # --------------------------------------------------------
+
+    print("\n⚙️ Configuring training...")
+
+    training_args = TrainingArguments(
+
+        output_dir=str(
+            BASE_DIR / "v4_checkpoints"
+        ),
+
+        eval_strategy="epoch",
+
+        save_strategy="epoch",
+
+        logging_strategy="steps",
+
+        logging_steps=100,
+
+        learning_rate=2e-5,
+
+        per_device_train_batch_size=8,
+
+        per_device_eval_batch_size=16,
+
+        gradient_accumulation_steps=1,
+
+        num_train_epochs=2,
+
+        weight_decay=0.01,
+
+        load_best_model_at_end=True,
+
+        metric_for_best_model="macro_f1",
+
+        greater_is_better=True,
+
+        save_total_limit=1,
+
+        report_to="none",
+
+        fp16=False,
+
+        dataloader_num_workers=0,
+
+        seed=RANDOM_SEED,
     )
 
     # --------------------------------------------------------
-    # 11. Save model
+    # TRAINER
     # --------------------------------------------------------
 
-    model_package = {
-        "model": model,
-        "vocabulary": vocabulary,
-        "idf": idf,
-        "classes": model.classes,
-    }
+    trainer = Trainer(
 
-    with open(
-        MODEL_PATH,
-        "wb"
-    ) as file:
+        model=model,
 
-        pickle.dump(
-            model_package,
-            file
-        )
+        args=training_args,
 
-    print(
-        f"\n💾 Model saved to:\n"
-        f"{MODEL_PATH}"
+        train_dataset=train_dataset,
+
+        eval_dataset=validation_dataset,
+
+        processing_class=tokenizer,
+
+        compute_metrics=calculate_metrics,
     )
 
     # --------------------------------------------------------
-    # 12. Test real sentences
+    # TRAIN
     # --------------------------------------------------------
 
     print("\n")
-    print("=" * 60)
-    print("             QUICK MODEL TEST")
-    print("=" * 60)
+    print("=" * 65)
+    print("                 🚀 TRAINING V4")
+    print("=" * 65)
 
-    examples = [
+    trainer.train()
+
+    print("\n✅ V4 training complete!")
+
+    # --------------------------------------------------------
+    # VALIDATION
+    # --------------------------------------------------------
+
+    print("\n")
+    print("=" * 65)
+    print("              VALIDATION RESULTS")
+    print("=" * 65)
+
+    validation_result = trainer.evaluate(
+        validation_dataset
+    )
+
+    for key, value in validation_result.items():
+
+        if isinstance(value, float):
+
+            print(
+                f"{key:<25}: {value:.4f}"
+            )
+
+    # --------------------------------------------------------
+    # TEST
+    # --------------------------------------------------------
+
+    print("\n")
+    print("=" * 65)
+    print("                 TEST RESULTS")
+    print("=" * 65)
+
+    test_output = trainer.predict(
+        test_dataset
+    )
+
+    test_metrics = calculate_metrics(
+        (
+            test_output.predictions,
+            test_output.label_ids
+        )
+    )
+
+    print(
+        f"\nAccuracy         : "
+        f"{test_metrics['accuracy']:.4f}"
+    )
+
+    print(
+        f"Macro F1         : "
+        f"{test_metrics['macro_f1']:.4f}"
+    )
+
+    print(
+        f"Macro Precision  : "
+        f"{test_metrics['macro_precision']:.4f}"
+    )
+
+    print(
+        f"Macro Recall     : "
+        f"{test_metrics['macro_recall']:.4f}"
+    )
+
+    print_per_class_report(
+        test_output.predictions,
+        test_output.label_ids
+    )
+
+    print_confusion_matrix(
+        test_output.predictions,
+        test_output.label_ids
+    )
+
+    # --------------------------------------------------------
+    # SAVE MODEL
+    # --------------------------------------------------------
+
+    print("\n💾 Saving V4 model...")
+
+    MODEL_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    trainer.save_model(
+        str(MODEL_DIR)
+    )
+
+    tokenizer.save_pretrained(
+        str(MODEL_DIR)
+    )
+
+    metadata = {
+
+        "model_version": "v4",
+
+        "base_model": MODEL_NAME,
+
+        "labels": LABEL_NAMES,
+
+        "max_length": MAX_LENGTH,
+
+        "training_samples": len(train_rows),
+
+        "validation_samples": len(validation_rows),
+
+        "test_samples": len(test_rows),
+
+        "test_accuracy": test_metrics["accuracy"],
+
+        "test_macro_f1": test_metrics["macro_f1"],
+
+        "test_macro_precision": test_metrics[
+            "macro_precision"
+        ],
+
+        "test_macro_recall": test_metrics[
+            "macro_recall"
+        ],
+    }
+
+    with open(
+        MODEL_DIR / "metadata.json",
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            metadata,
+            file,
+            indent=4
+        )
+
+    print(
+        f"\n✅ V4 model saved to:"
+    )
+
+    print(MODEL_DIR)
+
+    # --------------------------------------------------------
+    # QUICK TEST
+    # --------------------------------------------------------
+
+    print("\n")
+    print("=" * 65)
+    print("                   V4 QUICK TEST")
+    print("=" * 65)
+
+    quick_sentences = [
+
         "I am really happy today!",
+
         "I feel completely hopeless and sad.",
+
         "I am so angry about what happened.",
+
         "I am nervous about tomorrow.",
+
         "I don't understand what is happening.",
+
         "Today was a normal day.",
+
     ]
 
-    example_matrix, _ = compute_tf_idf(
-        examples,
-        vocabulary,
-        idf
+    encoded = tokenizer(
+        quick_sentences,
+        padding=True,
+        truncation=True,
+        max_length=MAX_LENGTH,
+        return_tensors="pt",
     )
 
-    predictions = model.predict(
-        example_matrix
-    )
+    encoded = {
+        key: value.to(model.device)
+        for key, value in encoded.items()
+    }
 
-    probabilities = model.predict_proba(
-        example_matrix
-    )
+    model.eval()
+
+    with torch.no_grad():
+
+        outputs = model(**encoded)
+
+        probabilities = torch.softmax(
+            outputs.logits,
+            dim=1
+        )
+
+        predictions = torch.argmax(
+            probabilities,
+            dim=1
+        )
 
     for text, prediction, probability in zip(
-        examples,
+        quick_sentences,
         predictions,
         probabilities
     ):
 
-        confidence = np.max(
-            probability
+        predicted_label = ID2LABEL[
+            prediction.item()
+        ]
+
+        confidence = (
+            probability[prediction].item()
+            * 100
+        )
+
+        print(f"\nText: {text}")
+
+        print(
+            f"Prediction: {predicted_label}"
         )
 
         print(
-            f"\nText: {text}"
+            f"Confidence: {confidence:.2f}%"
         )
 
-        print(
-            f"Prediction: {prediction}"
-        )
-
-        print(
-            f"Confidence: {confidence:.2%}"
-        )
+    # --------------------------------------------------------
+    # FINAL
+    # --------------------------------------------------------
 
     print("\n")
-    print("=" * 60)
-    print("          🎉 TRAINING FINISHED")
-    print("=" * 60)
+    print("=" * 65)
+    print("              🎉 V4 FINISHED")
+    print("=" * 65)
 
     print(
-        f"\nFinal test accuracy: "
-        f"{test_accuracy:.2%}"
+        f"\nFinal Test Accuracy: "
+        f"{test_metrics['accuracy'] * 100:.2f}%"
     )
+
+    print(
+        f"Final Test Macro F1: "
+        f"{test_metrics['macro_f1']:.4f}"
+    )
+
+    print(
+        f"\nModel directory:"
+    )
+
+    print(MODEL_DIR)
 
     print("\n")
 

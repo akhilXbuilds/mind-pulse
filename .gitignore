@@ -1,23 +1,45 @@
+# =========================
 # Python
+# =========================
 backend/.venv/
 backend/**/__pycache__/
 *.pyc
 
+# =========================
 # Environment variables
+# =========================
 .env
 backend/.env
 
+# =========================
 # ML generated files
+# =========================
 backend/ml/emotion_model.pkl
+backend/ml/emotion_model_v2.pkl
+backend/ml/emotion_model_v3.pkl
+backend/ml/emotion_model_v4/
+backend/ml/v4_checkpoints/
 backend/ml/*.png
 
-# Hugging Face / cache
+# =========================
+# Hugging Face / ML cache
+# =========================
 .cache/
 backend/.cache/
 
-# Node
+# =========================
+# Node / React
+# =========================
 frontend/node_modules/
 frontend/dist/
 
+# =========================
 # IDE
+# =========================
 .vscode/
+
+# =========================
+# Python tooling
+# =========================
+.pytest_cache/
+.mypy_cache/

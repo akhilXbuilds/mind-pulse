@@ -1,625 +1,1227 @@
-import os
-from typing import Optional
+from pathlib import Path
+from collections import Counter
+import re
+import pickle
 
-from dotenv import load_dotenv
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-
-from google import genai
-from google.genai import types
+import numpy as np
+import pandas as pd
+from datasets import load_dataset
 
 
 # ============================================================
-# LOAD ENVIRONMENT VARIABLES
+# PATHS
 # ============================================================
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "emotion_model_v2.pkl"
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+RANDOM_SEED = 42
+MIN_DF = 2
+MAX_FEATURES = 30000
 
-if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY not found. "
-        "Make sure your backend/.env file contains GEMINI_API_KEY."
-    )
-
-
-# ============================================================
-# GEMINI CLIENT
-# ============================================================
-
-client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
-
-MODEL_NAME = "gemini-3.8-flash"
+np.random.seed(RANDOM_SEED)
 
 
 # ============================================================
-# FASTAPI APPLICATION
+# GOEMOTIONS -> MIND PULSE MAPPING
 # ============================================================
 
-app = FastAPI(
-    title="Mind Pulse API",
-    description="AI-powered emotional wellness assistant",
-    version="1.0.0"
-)
-
-
-# ============================================================
-# CORS
-# ============================================================
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ============================================================
-# REQUEST MODEL
-# ============================================================
-
-class ChatRequest(BaseModel):
-    message: str
-    session_id: Optional[str] = "default"
-
-
-# ============================================================
-# RESPONSE MODEL
-# ============================================================
-
-class ChatResponse(BaseModel):
-    reply: str
-    emotion: str
-    risk: str
-    confidence: int
-
-
-# ============================================================
-# CONVERSATION MEMORY
-# ============================================================
-
-# Example:
-#
-# conversations = {
-#     "default": [
-#         {
-#             "role": "user",
-#             "text": "I'm stressed about exams"
-#         },
-#         {
-#             "role": "model",
-#             "text": "What part of the exams is worrying you?"
-#         }
-#     ]
-# }
-
-conversations = {}
-
-
-# ============================================================
-# MIND PULSE PERSONALITY
-# ============================================================
-
-SYSTEM_INSTRUCTION = """
-You are Mind Pulse, an AI-powered emotional wellness assistant.
-
-Your purpose is to provide supportive, natural and personalized
-conversations that help users reflect on what they are experiencing.
-
-PERSONALITY:
-- Calm
-- Warm
-- Empathetic
-- Intelligent
-- Friendly
-- Non-judgmental
-- Natural
-- Conversational
-
-CONVERSATION RULES:
-
-1. Understand the user's actual message before responding.
-
-2. Give responses specific to what the user said.
-
-3. Do NOT give the same response repeatedly.
-
-4. Do NOT constantly say:
-   - "Take a deep breath."
-   - "Everything will be okay."
-   - "I'm sorry you're feeling this way."
-
-5. Avoid generic motivational speeches unless they are actually useful.
-
-6. Ask a follow-up question when it naturally helps the conversation.
-
-7. Remember information from earlier messages in the conversation.
-
-8. If the user says something related to exams, college, relationships,
-   work, loneliness, stress, anxiety, anger, confidence, etc.,
-   respond specifically to that situation.
-
-9. Keep normal responses relatively concise:
-   usually around 2-5 sentences.
-
-10. Speak naturally, like a thoughtful AI companion.
-
-11. Never pretend to be human.
-
-12. Never claim to diagnose a mental health condition.
-
-13. Never claim that facial expressions, text or AI can medically
-    diagnose someone's mental health.
-
-14. If the user is in immediate danger or expresses an intention
-    to seriously hurt themselves or someone else, prioritize
-    immediate real-world help.
-
-15. In a crisis, encourage the user to contact local emergency
-    services, a crisis service, or a trusted person who can
-    stay with them.
-
-16. Never provide instructions for self-harm, suicide, violence,
-    or other dangerous activities.
-
-Mind Pulse is an emotional wellness support tool, not a medical
-diagnosis system.
-"""
-
-
-# ============================================================
-# EMOTION DETECTION
-# ============================================================
-
-def detect_emotion(message: str) -> tuple[str, int]:
-
-    text = message.lower()
-
-    # --------------------------------------------------------
-    # Distressed
-    # --------------------------------------------------------
-
-    distressed_words = [
-        "suicide",
-        "kill myself",
-        "end my life",
-        "want to die",
-        "i want to die",
-        "hurt myself",
-        "harm myself",
-        "self harm",
-        "self-harm",
-        "no reason to live",
-        "can't go on",
-        "cannot go on",
-    ]
-
-    for word in distressed_words:
-
-        if word in text:
-            return "Distressed", 96
-
-    # --------------------------------------------------------
-    # Angry
-    # --------------------------------------------------------
-
-    angry_words = [
-        "angry",
-        "furious",
-        "rage",
-        "mad",
-        "annoyed",
-        "pissed",
-        "frustrated",
-        "hate",
-    ]
-
-    for word in angry_words:
-
-        if word in text:
-            return "Angry", 84
-
-    # --------------------------------------------------------
-    # Sad
-    # --------------------------------------------------------
-
-    sad_words = [
-        "sad",
-        "crying",
-        "cry",
-        "lonely",
-        "heartbroken",
-        "hopeless",
-        "upset",
-        "unhappy",
-    ]
-
-    for word in sad_words:
-
-        if word in text:
-            return "Sad", 84
-
-    # --------------------------------------------------------
-    # Stressed
-    # --------------------------------------------------------
-
-    stressed_words = [
-        "stress",
-        "stressed",
-        "exam",
-        "exams",
-        "pressure",
-        "overwhelmed",
-        "deadline",
-        "anxious",
-        "anxiety",
-        "worried",
-        "worry",
-        "tension",
-        "nervous",
-    ]
-
-    for word in stressed_words:
-
-        if word in text:
-            return "Stressed", 84
-
-    # --------------------------------------------------------
-    # Happy
-    # --------------------------------------------------------
-
-    happy_words = [
-        "happy",
-        "great",
-        "excited",
-        "awesome",
-        "amazing",
+EMOTION_GROUPS = {
+    "Positive": [
+        "admiration",
+        "amusement",
+        "approval",
+        "caring",
+        "excitement",
+        "gratitude",
         "joy",
-        "glad",
-        "good",
-        "wonderful",
-        "proud",
-    ]
+        "love",
+        "optimism",
+        "pride",
+        "relief",
+    ],
 
-    for word in happy_words:
+    "Sad": [
+        "disappointment",
+        "grief",
+        "remorse",
+        "sadness",
+    ],
 
-        if word in text:
-            return "Happy", 88
+    "Angry": [
+        "anger",
+        "annoyance",
+        "disapproval",
+        "disgust",
+    ],
 
-    # --------------------------------------------------------
-    # Default
-    # --------------------------------------------------------
+    "Fear": [
+        "fear",
+        "nervousness",
+    ],
 
-    return "Neutral", 78
+    "Confused": [
+        "confusion",
+    ],
+
+    "Neutral": [
+        "neutral",
+        "realization",
+    ],
+}
 
 
-# ============================================================
-# RISK DETECTION
-# ============================================================
-
-def detect_risk(message: str) -> str:
-
-    text = message.lower()
-
-    # --------------------------------------------------------
-    # HIGH RISK
-    # --------------------------------------------------------
-
-    high_risk_words = [
-        "kill myself",
-        "suicide",
-        "commit suicide",
-        "end my life",
-        "want to die",
-        "i want to die",
-        "going to kill myself",
-        "hurt myself",
-        "harm myself",
-        "self harm",
-        "self-harm",
-        "no reason to live",
-        "can't go on",
-        "cannot go on",
-    ]
-
-    for word in high_risk_words:
-
-        if word in text:
-            return "HIGH"
-
-    # --------------------------------------------------------
-    # MEDIUM RISK
-    # --------------------------------------------------------
-
-    medium_risk_words = [
-        "hopeless",
-        "worthless",
-        "helpless",
-        "completely alone",
-        "can't cope",
-        "cannot cope",
-        "falling apart",
-        "extremely depressed",
-    ]
-
-    for word in medium_risk_words:
-
-        if word in text:
-            return "MEDIUM"
-
-    # --------------------------------------------------------
-    # LOW RISK
-    # --------------------------------------------------------
-
-    return "LOW"
+# These emotions are intentionally excluded because
+# forcing them into our six classes could introduce noise.
+EXCLUDED_EMOTIONS = {
+    "curiosity",
+    "desire",
+    "surprise",
+    "embarrassment",
+}
 
 
 # ============================================================
-# CONVERSATION FUNCTIONS
+# TOKENIZATION
 # ============================================================
 
-def save_message(
-    session_id: str,
-    role: str,
-    text: str
-):
+def tokenize(text):
+    """
+    Convert text into lowercase word tokens.
+    Keeps simple contractions such as don't, can't, I'm.
+    """
 
-    if session_id not in conversations:
+    text = text.lower()
 
-        conversations[session_id] = []
+    tokens = re.findall(
+        r"[a-z]+(?:'[a-z]+)?",
+        text
+    )
 
-    conversations[session_id].append(
-        {
-            "role": role,
-            "text": text
+    return tokens
+
+
+# ============================================================
+# CUSTOM TF-IDF VECTORIZER
+# ============================================================
+
+class TfidfVectorizerCustom:
+
+    def __init__(
+        self,
+        min_df=2,
+        max_features=30000
+    ):
+        self.min_df = min_df
+        self.max_features = max_features
+
+        self.vocabulary = {}
+        self.idf = None
+
+    def create_features(self, tokens):
+        """
+        Create:
+        - unigrams: happy
+        - bigrams: very__happy
+        """
+
+        features = []
+
+        # -----------------------------
+        # Unigrams
+        # -----------------------------
+
+        for token in tokens:
+            features.append(token)
+
+        # -----------------------------
+        # Bigrams
+        # -----------------------------
+
+        for i in range(len(tokens) - 1):
+
+            bigram = (
+                tokens[i]
+                + "__"
+                + tokens[i + 1]
+            )
+
+            features.append(bigram)
+
+        return features
+
+    def fit(self, texts):
+
+        document_frequency = Counter()
+
+        print("\nBuilding document frequencies...")
+
+        for text in texts:
+
+            tokens = tokenize(text)
+
+            features = set(
+                self.create_features(tokens)
+            )
+
+            for feature in features:
+                document_frequency[feature] += 1
+
+        # Keep features appearing in at least MIN_DF documents.
+        valid_features = [
+            feature
+            for feature, count
+            in document_frequency.items()
+            if count >= self.min_df
+        ]
+
+        # Most frequent features first.
+        valid_features.sort(
+            key=lambda feature:
+            document_frequency[feature],
+            reverse=True
+        )
+
+        # Limit vocabulary size.
+        valid_features = valid_features[
+            :self.max_features
+        ]
+
+        self.vocabulary = {
+            feature: index
+            for index, feature
+            in enumerate(valid_features)
         }
-    )
 
-    # Keep only the latest 20 messages.
-    conversations[session_id] = conversations[session_id][-20:]
+        n_documents = len(texts)
 
-
-def build_gemini_history(session_id: str):
-
-    history = conversations.get(
-        session_id,
-        []
-    )
-
-    contents = []
-
-    for message in history:
-
-        contents.append(
-            types.Content(
-                role=message["role"],
-                parts=[
-                    types.Part(
-                        text=message["text"]
-                    )
-                ]
-            )
+        document_counts = np.array(
+            [
+                document_frequency[feature]
+                for feature in valid_features
+            ],
+            dtype=np.float32
         )
 
-    return contents
-
-
-# ============================================================
-# ROOT ENDPOINT
-# ============================================================
-
-@app.get("/")
-def root():
-
-    return {
-        "message": "Mind Pulse API is running",
-        "status": "online",
-        "model": MODEL_NAME
-    }
-
-
-# ============================================================
-# HEALTH ENDPOINT
-# ============================================================
-
-@app.get("/health")
-def health():
-
-    return {
-        "status": "healthy",
-        "gemini": "configured",
-        "application": "Mind Pulse"
-    }
-
-
-# ============================================================
-# CHAT ENDPOINT
-# ============================================================
-
-@app.post(
-    "/chat",
-    response_model=ChatResponse
-)
-def chat(request: ChatRequest):
-
-    # --------------------------------------------------------
-    # Clean input
-    # --------------------------------------------------------
-
-    message = request.message.strip()
-
-    if not message:
-
-        return ChatResponse(
-            reply="I'm here. Tell me what's on your mind.",
-            emotion="Neutral",
-            risk="LOW",
-            confidence=78
-        )
-
-    # --------------------------------------------------------
-    # Session
-    # --------------------------------------------------------
-
-    session_id = request.session_id or "default"
-
-    # --------------------------------------------------------
-    # Emotion
-    # --------------------------------------------------------
-
-    emotion, confidence = detect_emotion(
-        message
-    )
-
-    # --------------------------------------------------------
-    # Risk
-    # --------------------------------------------------------
-
-    risk = detect_risk(
-        message
-    )
-
-    # --------------------------------------------------------
-    # Save user message
-    # --------------------------------------------------------
-
-    save_message(
-        session_id=session_id,
-        role="user",
-        text=message
-    )
-
-    # --------------------------------------------------------
-    # Get conversation history
-    # --------------------------------------------------------
-
-    history = build_gemini_history(
-        session_id
-    )
-
-    # --------------------------------------------------------
-    # Dynamic system context
-    # --------------------------------------------------------
-
-    dynamic_instruction = f"""
-CURRENT MESSAGE ANALYSIS
-
-Estimated emotion:
-{emotion}
-
-Estimated safety risk:
-{risk}
-
-These are simple application-level signals.
-They are NOT medical diagnoses.
-
-Use this information only as supporting context.
-The user's actual words and conversation context
-are more important than these labels.
-
-Respond naturally to the user.
-"""
-
-    # --------------------------------------------------------
-    # Gemini generation
-    # --------------------------------------------------------
-
-    try:
-
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=history,
-            config=types.GenerateContentConfig(
-                system_instruction=(
-                    SYSTEM_INSTRUCTION
-                    + "\n\n"
-                    + dynamic_instruction
-                ),
-                temperature=0.9,
-                max_output_tokens=500
+        # Smoothed IDF.
+        self.idf = (
+            np.log(
+                (1 + n_documents)
+                / (1 + document_counts)
             )
+            + 1
         )
-
-        reply = response.text.strip()
-
-        if not reply:
-
-            reply = (
-                "I'm listening. Tell me a little more "
-                "about what's going on."
-            )
-
-    except Exception as error:
 
         print(
-            "Gemini API Error:",
-            error
+            f"Vocabulary size: "
+            f"{len(self.vocabulary)}"
         )
 
-        reply = (
-            "I'm having trouble connecting to my AI service "
-            "right now. Please try sending that again."
+        return self
+
+    def transform(self, texts):
+
+        matrix = np.zeros(
+            (
+                len(texts),
+                len(self.vocabulary)
+            ),
+            dtype=np.float32
         )
 
-    # --------------------------------------------------------
-    # Save AI response
-    # --------------------------------------------------------
+        for row, text in enumerate(texts):
 
-    save_message(
-        session_id=session_id,
-        role="model",
-        text=reply
-    )
+            tokens = tokenize(text)
 
-    # --------------------------------------------------------
-    # HIGH-RISK SAFETY RESPONSE
-    # --------------------------------------------------------
+            features = self.create_features(
+                tokens
+            )
 
-    if risk == "HIGH":
+            if not features:
+                continue
 
-        reply += (
-            "\n\nIf you feel you may act on these thoughts "
-            "or you're in immediate danger, please contact "
-            "your local emergency service or a crisis service "
-            "right now, and reach out to someone you trust "
-            "who can stay with you."
-        )
+            feature_counts = Counter(
+                features
+            )
 
-    # --------------------------------------------------------
-    # Return result
-    # --------------------------------------------------------
+            total_features = len(features)
 
-    return ChatResponse(
-        reply=reply,
-        emotion=emotion,
-        risk=risk,
-        confidence=confidence
-    )
+            for feature, count in feature_counts.items():
+
+                if feature not in self.vocabulary:
+                    continue
+
+                column = self.vocabulary[
+                    feature
+                ]
+
+                tf = (
+                    count
+                    / total_features
+                )
+
+                matrix[row, column] = (
+                    tf
+                    * self.idf[column]
+                )
+
+        return matrix
+
+    def fit_transform(self, texts):
+
+        self.fit(texts)
+
+        return self.transform(texts)
 
 
 # ============================================================
-# CLEAR CHAT
+# MULTINOMIAL NAIVE BAYES
 # ============================================================
 
-@app.delete(
-    "/chat/{session_id}"
-)
-def clear_chat(session_id: str):
+class MultinomialNaiveBayes:
 
-    if session_id in conversations:
+    def __init__(self, alpha=1.0):
 
-        del conversations[session_id]
+        self.alpha = alpha
 
-    return {
-        "message": "Conversation cleared",
-        "session_id": session_id
+        self.classes = None
+        self.class_log_prior = None
+        self.feature_log_prob = None
+
+    def fit(self, X, y):
+
+        self.classes = np.unique(y)
+
+        number_of_classes = len(
+            self.classes
+        )
+
+        number_of_features = X.shape[1]
+
+        self.class_log_prior = np.zeros(
+            number_of_classes
+        )
+
+        self.feature_log_prob = np.zeros(
+            (
+                number_of_classes,
+                number_of_features
+            )
+        )
+
+        for class_index, class_name in enumerate(
+            self.classes
+        ):
+
+            X_class = X[
+                y == class_name
+            ]
+
+            # Prior probability.
+            self.class_log_prior[
+                class_index
+            ] = np.log(
+                len(X_class)
+                / len(X)
+            )
+
+            # Count feature occurrences.
+            feature_counts = (
+                X_class.sum(axis=0)
+            )
+
+            # Laplace smoothing.
+            smoothed_counts = (
+                feature_counts
+                + self.alpha
+            )
+
+            total_count = (
+                smoothed_counts.sum()
+            )
+
+            self.feature_log_prob[
+                class_index
+            ] = np.log(
+                smoothed_counts
+                / total_count
+            )
+
+        return self
+
+    def predict_log_proba(self, X):
+
+        scores = (
+            X
+            @ self.feature_log_prob.T
+        )
+
+        scores += (
+            self.class_log_prior
+        )
+
+        # Numerical stability.
+        max_scores = scores.max(
+            axis=1,
+            keepdims=True
+        )
+
+        log_sum_exp = (
+            max_scores
+            + np.log(
+                np.exp(
+                    scores - max_scores
+                ).sum(
+                    axis=1,
+                    keepdims=True
+                )
+            )
+        )
+
+        return (
+            scores
+            - log_sum_exp
+        )
+
+    def predict_proba(self, X):
+
+        return np.exp(
+            self.predict_log_proba(X)
+        )
+
+    def predict(self, X):
+
+        log_probabilities = (
+            self.predict_log_proba(X)
+        )
+
+        indexes = np.argmax(
+            log_probabilities,
+            axis=1
+        )
+
+        return self.classes[indexes]
+
+
+# ============================================================
+# EMOTION MAPPING
+# ============================================================
+
+def create_label_mapping():
+
+    mapping = {}
+
+    for group, emotions in (
+        EMOTION_GROUPS.items()
+    ):
+
+        for emotion in emotions:
+            mapping[emotion] = group
+
+    return mapping
+
+
+# ============================================================
+# DATA CLEANING
+# ============================================================
+
+def prepare_dataset(
+    split,
+    label_names
+):
+
+    label_mapping = (
+        create_label_mapping()
+    )
+
+    rows = []
+
+    for item in split:
+
+        text = item["text"]
+
+        if text is None:
+            continue
+
+        text = text.strip()
+
+        # Remove empty text.
+        if not text:
+            continue
+
+        # Get original GoEmotions label.
+        original_label = (
+            label_names[
+                item["labels"][0]
+            ]
+        )
+
+        # Ignore ambiguous classes.
+        if original_label not in label_mapping:
+            continue
+
+        new_label = (
+            label_mapping[
+                original_label
+            ]
+        )
+
+        rows.append(
+            {
+                "text": text,
+                "emotion": new_label
+            }
+        )
+
+    df = pd.DataFrame(rows)
+
+    before = len(df)
+
+    # Remove exact duplicate texts.
+    df = df.drop_duplicates(
+        subset=["text"]
+    )
+
+    df = df.reset_index(
+        drop=True
+    )
+
+    removed = (
+        before - len(df)
+    )
+
+    print(
+        f"Removed duplicate texts: "
+        f"{removed}"
+    )
+
+    return df
+
+
+# ============================================================
+# BALANCE TRAINING DATA
+# ============================================================
+
+def balance_training_data(df):
+
+    counts = (
+        df["emotion"]
+        .value_counts()
+    )
+
+    print(
+        "\nClass distribution "
+        "before balancing:"
+    )
+
+    print(counts)
+
+    # Smallest class determines
+    # the balanced target size.
+    target_size = counts.min()
+
+    print(
+        f"\nTarget samples per class: "
+        f"{target_size}"
+    )
+
+    balanced_parts = []
+
+    for emotion in sorted(
+        counts.index
+    ):
+
+        class_df = df[
+            df["emotion"] == emotion
+        ]
+
+        sampled = class_df.sample(
+            n=target_size,
+            random_state=RANDOM_SEED
+        )
+
+        balanced_parts.append(
+            sampled
+        )
+
+    balanced_df = pd.concat(
+        balanced_parts,
+        ignore_index=True
+    )
+
+    # Shuffle balanced dataset.
+    balanced_df = balanced_df.sample(
+        frac=1,
+        random_state=RANDOM_SEED
+    )
+
+    balanced_df = (
+        balanced_df
+        .reset_index(drop=True)
+    )
+
+    print(
+        "\nClass distribution "
+        "after balancing:"
+    )
+
+    print(
+        balanced_df[
+            "emotion"
+        ].value_counts()
+    )
+
+    return balanced_df
+
+
+# ============================================================
+# CONFUSION MATRIX
+# ============================================================
+
+def create_confusion_matrix(
+    y_true,
+    y_pred,
+    classes
+):
+
+    matrix = np.zeros(
+        (
+            len(classes),
+            len(classes)
+        ),
+        dtype=int
+    )
+
+    class_to_index = {
+        name: index
+        for index, name
+        in enumerate(classes)
     }
+
+    for actual, predicted in zip(
+        y_true,
+        y_pred
+    ):
+
+        actual_index = (
+            class_to_index[actual]
+        )
+
+        predicted_index = (
+            class_to_index[predicted]
+        )
+
+        matrix[
+            actual_index,
+            predicted_index
+        ] += 1
+
+    return matrix
+
+
+# ============================================================
+# CLASSIFICATION METRICS
+# ============================================================
+
+def calculate_metrics(
+    y_true,
+    y_pred,
+    classes
+):
+
+    matrix = create_confusion_matrix(
+        y_true,
+        y_pred,
+        classes
+    )
+
+    results = []
+
+    for index, class_name in enumerate(
+        classes
+    ):
+
+        true_positive = (
+            matrix[index, index]
+        )
+
+        false_positive = (
+            matrix[:, index].sum()
+            - true_positive
+        )
+
+        false_negative = (
+            matrix[index, :].sum()
+            - true_positive
+        )
+
+        if (
+            true_positive
+            + false_positive
+        ) > 0:
+
+            precision = (
+                true_positive
+                /
+                (
+                    true_positive
+                    + false_positive
+                )
+            )
+
+        else:
+
+            precision = 0.0
+
+        if (
+            true_positive
+            + false_negative
+        ) > 0:
+
+            recall = (
+                true_positive
+                /
+                (
+                    true_positive
+                    + false_negative
+                )
+            )
+
+        else:
+
+            recall = 0.0
+
+        if (
+            precision + recall
+        ) > 0:
+
+            f1 = (
+                2
+                * precision
+                * recall
+                /
+                (
+                    precision
+                    + recall
+                )
+            )
+
+        else:
+
+            f1 = 0.0
+
+        results.append(
+            {
+                "class": class_name,
+                "precision": precision,
+                "recall": recall,
+                "f1": f1
+            }
+        )
+
+    accuracy = np.mean(
+        np.array(y_true)
+        == np.array(y_pred)
+    )
+
+    macro_f1 = np.mean(
+        [
+            result["f1"]
+            for result in results
+        ]
+    )
+
+    return (
+        accuracy,
+        macro_f1,
+        results,
+        matrix
+    )
+
+
+# ============================================================
+# PRINT EVALUATION
+# ============================================================
+
+def print_report(
+    title,
+    y_true,
+    y_pred,
+    classes
+):
+
+    (
+        accuracy,
+        macro_f1,
+        results,
+        matrix
+    ) = calculate_metrics(
+        y_true,
+        y_pred,
+        classes
+    )
+
+    print(
+        "\n"
+        + "=" * 65
+    )
+
+    print(title)
+
+    print(
+        "=" * 65
+    )
+
+    print(
+        f"Accuracy : "
+        f"{accuracy:.4f}"
+    )
+
+    print(
+        f"Macro F1 : "
+        f"{macro_f1:.4f}"
+    )
+
+    print(
+        "\nPer-class metrics:"
+    )
+
+    print(
+        f"{'Class':<12}"
+        f"{'Precision':<12}"
+        f"{'Recall':<12}"
+        f"{'F1':<12}"
+    )
+
+    for result in results:
+
+        print(
+            f"{result['class']:<12}"
+            f"{result['precision']:<12.4f}"
+            f"{result['recall']:<12.4f}"
+            f"{result['f1']:<12.4f}"
+        )
+
+    print(
+        "\nConfusion Matrix"
+    )
+
+    print(
+        "Rows = Actual"
+    )
+
+    print(
+        "Columns = Predicted"
+    )
+
+    print()
+
+    print(
+        f"{'':<12}"
+        + "".join(
+            f"{class_name:<12}"
+            for class_name in classes
+        )
+    )
+
+    for class_name, row in zip(
+        classes,
+        matrix
+    ):
+
+        print(
+            f"{class_name:<12}"
+            + "".join(
+                f"{value:<12}"
+                for value in row
+            )
+        )
+
+
+# ============================================================
+# MAIN TRAINING PIPELINE
+# ============================================================
+
+def main():
+
+    print(
+        "\n"
+        + "=" * 60
+    )
+
+    print(
+        "        MIND PULSE — V2 ML TRAINING"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    # --------------------------------------------------------
+    # LOAD DATASET
+    # --------------------------------------------------------
+
+    print(
+        "\n📥 Loading GoEmotions..."
+    )
+
+    dataset = load_dataset(
+        "google-research-datasets/go_emotions",
+        "simplified"
+    )
+
+    print(
+        "✅ Dataset loaded"
+    )
+
+    print(dataset)
+
+    label_names = (
+        dataset[
+            "train"
+        ]
+        .features[
+            "labels"
+        ]
+        .feature
+        .names
+    )
+
+    # --------------------------------------------------------
+    # CLEAN DATA
+    # --------------------------------------------------------
+
+    print(
+        "\n🧹 Cleaning training data..."
+    )
+
+    train_df = prepare_dataset(
+        dataset["train"],
+        label_names
+    )
+
+    print(
+        "\n🧹 Cleaning validation data..."
+    )
+
+    validation_df = prepare_dataset(
+        dataset["validation"],
+        label_names
+    )
+
+    print(
+        "\n🧹 Cleaning test data..."
+    )
+
+    test_df = prepare_dataset(
+        dataset["test"],
+        label_names
+    )
+
+    print(
+        "\nClean dataset sizes:"
+    )
+
+    print(
+        f"Training   : "
+        f"{len(train_df)}"
+    )
+
+    print(
+        f"Validation : "
+        f"{len(validation_df)}"
+    )
+
+    print(
+        f"Test       : "
+        f"{len(test_df)}"
+    )
+
+    # --------------------------------------------------------
+    # BALANCE ONLY TRAINING DATA
+    # --------------------------------------------------------
+
+    print(
+        "\n⚖️ Balancing training data..."
+    )
+
+    train_df = balance_training_data(
+        train_df
+    )
+
+    # IMPORTANT:
+    # Validation and test datasets
+    # remain untouched.
+    #
+    # This prevents data leakage and
+    # gives us a more honest evaluation.
+
+    # --------------------------------------------------------
+    # TF-IDF
+    # --------------------------------------------------------
+
+    print(
+        "\n🧠 Building TF-IDF vocabulary..."
+    )
+
+    vectorizer = (
+        TfidfVectorizerCustom(
+            min_df=MIN_DF,
+            max_features=MAX_FEATURES
+        )
+    )
+
+    print(
+        "\n⚙️ Creating training TF-IDF..."
+    )
+
+    X_train = (
+        vectorizer.fit_transform(
+            train_df["text"].tolist()
+        )
+    )
+
+    print(
+        f"Training matrix: "
+        f"{X_train.shape}"
+    )
+
+    print(
+        "\n⚙️ Creating validation TF-IDF..."
+    )
+
+    X_validation = (
+        vectorizer.transform(
+            validation_df["text"].tolist()
+        )
+    )
+
+    print(
+        f"Validation matrix: "
+        f"{X_validation.shape}"
+    )
+
+    print(
+        "\n⚙️ Creating test TF-IDF..."
+    )
+
+    X_test = (
+        vectorizer.transform(
+            test_df["text"].tolist()
+        )
+    )
+
+    print(
+        f"Test matrix: "
+        f"{X_test.shape}"
+    )
+
+    # --------------------------------------------------------
+    # LABELS
+    # --------------------------------------------------------
+
+    y_train = (
+        train_df[
+            "emotion"
+        ].to_numpy()
+    )
+
+    y_validation = (
+        validation_df[
+            "emotion"
+        ].to_numpy()
+    )
+
+    y_test = (
+        test_df[
+            "emotion"
+        ].to_numpy()
+    )
+
+    # --------------------------------------------------------
+    # TRAIN MODEL
+    # --------------------------------------------------------
+
+    print(
+        "\n🤖 Training Multinomial "
+        "Naive Bayes..."
+    )
+
+    model = MultinomialNaiveBayes(
+        alpha=1.0
+    )
+
+    model.fit(
+        X_train,
+        y_train
+    )
+
+    print(
+        "✅ Training complete!"
+    )
+
+    # --------------------------------------------------------
+    # CLASS ORDER
+    # --------------------------------------------------------
+
+    classes = [
+        "Angry",
+        "Confused",
+        "Fear",
+        "Neutral",
+        "Positive",
+        "Sad"
+    ]
+
+    # --------------------------------------------------------
+    # VALIDATION
+    # --------------------------------------------------------
+
+    validation_predictions = (
+        model.predict(
+            X_validation
+        )
+    )
+
+    print_report(
+        "VALIDATION RESULTS",
+        y_validation,
+        validation_predictions,
+        classes
+    )
+
+    # --------------------------------------------------------
+    # TEST
+    # --------------------------------------------------------
+
+    test_predictions = (
+        model.predict(
+            X_test
+        )
+    )
+
+    print_report(
+        "TEST RESULTS",
+        y_test,
+        test_predictions,
+        classes
+    )
+
+    # --------------------------------------------------------
+    # SAVE MODEL
+    # --------------------------------------------------------
+
+    model_data = {
+        "model": model,
+        "vectorizer": vectorizer,
+        "classes": classes,
+        "version": "v2"
+    }
+
+    with open(
+        MODEL_PATH,
+        "wb"
+    ) as file:
+
+        pickle.dump(
+            model_data,
+            file
+        )
+
+    print(
+        "\n💾 V2 model saved to:"
+    )
+
+    print(
+        MODEL_PATH
+    )
+
+    # --------------------------------------------------------
+    # QUICK MODEL TEST
+    # --------------------------------------------------------
+
+    examples = [
+        "I am really happy today!",
+        "I feel completely hopeless and sad.",
+        "I am so angry about what happened.",
+        "I am nervous about tomorrow.",
+        "I don't understand what is happening.",
+        "Today was a normal day.",
+    ]
+
+    print(
+        "\n"
+        + "=" * 60
+    )
+
+    print(
+        "             V2 QUICK TEST"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    example_matrix = (
+        vectorizer.transform(
+            examples
+        )
+    )
+
+    predictions = (
+        model.predict(
+            example_matrix
+        )
+    )
+
+    probabilities = (
+        model.predict_proba(
+            example_matrix
+        )
+    )
+
+    for text, prediction, probability in zip(
+        examples,
+        predictions,
+        probabilities
+    ):
+
+        confidence = (
+            probability.max()
+            * 100
+        )
+
+        print(
+            f"\nText: {text}"
+        )
+
+        print(
+            f"Prediction: "
+            f"{prediction}"
+        )
+
+        print(
+            f"Confidence: "
+            f"{confidence:.2f}%"
+        )
+
+    print(
+        "\n"
+        + "=" * 60
+    )
+
+    print(
+        "       🎉 V2 TRAINING FINISHED"
+    )
+
+    print(
+        "=" * 60
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    main()
